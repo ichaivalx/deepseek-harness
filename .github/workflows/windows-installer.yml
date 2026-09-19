@@ -1,0 +1,111 @@
+name: Build original Windows desktop installer
+
+on:
+  push:
+    branches: [codex/windows-installer]
+    paths: [.github/workflows/windows-installer.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-desktop-installer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      SOURCE_COMMIT: ddefc45fbc7f8e46dd73185e68295696d1297887
+    steps:
+      - name: Check out the unchanged official release source
+        uses: actions/checkout@v7
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: ddefc45fbc7f8e46dd73185e68295696d1297887
+          persist-credentials: false
+
+      - name: Verify the source revision
+        run: |
+          $actual = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:SOURCE_COMMIT) { throw 'Unexpected source revision' }
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) { throw 'The official source has changed' }
+          Write-Output "Official source: $actual"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          run_install: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Configure the unsigned personal build
+        run: |
+          $settings = @(
+            'DSH_DESKTOP_APP_ID=io.github.ichaivalx.deepseek-harness'
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production'
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://harness.deepseek.com'
+          )
+          $settings | Set-Content -LiteralPath 'apps/desktop/.env.windows' -Encoding utf8
+          "PYTHON=$((Get-Command python).Source)" | Out-File -LiteralPath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install the locked build dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
+
+      - name: Build the official unsigned Windows installer
+        run: |
+          pnpm run package:desktop:win:x64:unsigned --check
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop packaging configuration is invalid' }
+          pnpm run package:desktop:win:x64:unsigned
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop packaging failed' }
+
+      - name: Verify unchanged source and checksum the installer
+        run: |
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) { throw 'The build modified tracked source files' }
+          $output = 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $installers = @(Get-ChildItem -LiteralPath $output -Filter '*.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one Windows installer' }
+          $installer = $installers[0]
+          $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS.txt') -Encoding ascii
+          Write-Output "$($installer.Name): $($installer.Length) bytes; SHA256=$hash"
+          @(
+            "Source: https://github.com/deepseek-ai/deepseek-harness/commit/$env:SOURCE_COMMIT"
+            "Installer: $($installer.Name)"
+            "SHA256: $hash"
+            'Build: unsigned; product source unchanged; automatic updates omitted by the upstream unsigned build mode.'
+          ) | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload the installer and checksum
+        uses: actions/upload-artifact@v7
+        with:
+          name: deepseek-harness-0.1.6-alpha.2-win-x64-unsigned
+          path: |
+            apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/*.exe
+            apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Retain packaging diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-desktop-packaging-diagnostics
+          path: apps/desktop/.desktop-build/packaging-runs/
+          include-hidden-files: true
+          if-no-files-found: ignore
